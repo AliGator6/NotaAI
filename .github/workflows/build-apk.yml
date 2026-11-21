@@ -14,6 +14,12 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+      - name: Unduh Model AI Tulisan Tangan Offline (PP-OCRv5)
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fsSL -L "https://huggingface.co/monkt/paddleocr-onnx/resolve/main/languages/english/rec.onnx" -o app/src/main/assets/ppocr_rec.onnx
+          curl -fsSL -L "https://huggingface.co/monkt/paddleocr-onnx/resolve/main/languages/english/dict.txt" -o app/src/main/assets/ppocr_dict.txt
+          ls -lh app/src/main/assets/
       - name: Siapkan Gradle
         uses: gradle/actions/setup-gradle@v4
         with:

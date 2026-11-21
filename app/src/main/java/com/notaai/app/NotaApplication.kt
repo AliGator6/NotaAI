@@ -25,6 +25,6 @@ class NotaApplication : Application() {
         imageStorage = ImageStorageManager(this)
         repository = ReceiptRepository(database.receiptDao(), imageStorage)
         preferences = AppPreferences(this)
-        ocrEngine = LocalOcrEngine()
+        ocrEngine = LocalOcrEngine(this)
     }
 }

@@ -14,14 +14,11 @@ import kotlin.math.min
 
 data class PaddleLineResult(val text: String, val confidence: Float)
 
-/**
- * Mesin pengenalan teks tulisan tangan offline memakai PaddleOCR v5 (ONNX Runtime).
- * 100% lokal di HP tanpa koneksi internet.
- */
 class PaddleOnnxRecognizer(private val context: Context) {
     private var env: OrtEnvironment? = null
     private var session: OrtSession? = null
     private var dict: List<String> = emptyList()
+    private var numericAllowedIndices: BooleanArray? = null
     private var initialized = false
 
     @Synchronized
@@ -34,21 +31,30 @@ class PaddleOnnxRecognizer(private val context: Context) {
                 br.readLines().map { it.trimEnd('\r', '\n') }
             }
             val ortEnv = OrtEnvironment.getEnvironment()
-            val opts = OrtSession.SessionOptions().apply {
-                setIntraOpNumThreads(2)
-            }
             env = ortEnv
-            session = ortEnv.createSession(modelBytes, opts)
+            session = ortEnv.createSession(modelBytes, OrtSession.SessionOptions().apply { setIntraOpNumThreads(2) })
             dict = dictLines
+            buildNumericMask(dictLines)
             true
         } catch (_: Throwable) {
             false
         }
     }
 
+    private fun buildNumericMask(dictLines: List<String>) {
+        val allowedChars = setOf('0','1','2','3','4','5','6','7','8','9','.',',','-','/','x','X','=',' ')
+        val mask = BooleanArray(dictLines.size + 3)
+        mask[0] = true // CTC blank selalu diizinkan
+        dictLines.forEachIndexed { idx, tok ->
+            if (tok.length == 1 && tok[0] in allowedChars) mask[idx + 1] = true
+        }
+        if (dictLines.size + 1 < mask.size) mask[dictLines.size + 1] = true // spasi akhir
+        numericAllowedIndices = mask
+    }
+
     fun isAvailable(): Boolean = ensureInitialized()
 
-    fun recognizeCrop(crop: Bitmap): PaddleLineResult? {
+    fun recognizeCrop(crop: Bitmap, preferDigits: Boolean = false): PaddleLineResult? {
         if (!ensureInitialized()) return null
         val ortEnv = env ?: return null
         val ortSession = session ?: return null
@@ -56,7 +62,7 @@ class PaddleOnnxRecognizer(private val context: Context) {
         val inputInfo = ortSession.inputInfo.values.firstOrNull()?.info as? TensorInfo ?: return null
         val imgH = if (inputInfo.shape.size >= 4 && inputInfo.shape[2] > 0) inputInfo.shape[2].toInt() else 48
         val fixedW = if (inputInfo.shape.size >= 4 && inputInfo.shape[3] > 0) inputInfo.shape[3].toInt() else -1
-        val maxW = if (fixedW > 0) fixedW else 320
+        val maxW = if (fixedW > 0) fixedW else 960
 
         val ratio = crop.width.toFloat() / crop.height.coerceAtLeast(1).toFloat()
         val resizedW = min(ceil(imgH * ratio).toInt().coerceAtLeast(8), maxW)
@@ -67,7 +73,6 @@ class PaddleOnnxRecognizer(private val context: Context) {
         resized.getPixels(pixels, 0, resizedW, 0, 0, resizedW, imgH)
         if (resized !== crop) resized.recycle()
 
-        // PaddleOCR RecResizeImg: [1, 3, H, W], (x/255 - 0.5)/0.5, area padding = 0.0f
         val channelSize = imgH * targetW
         val tensorData = FloatArray(3 * channelSize)
         for (y in 0 until imgH) {
@@ -75,12 +80,9 @@ class PaddleOnnxRecognizer(private val context: Context) {
             val dstRow = y * targetW
             for (x in 0 until resizedW) {
                 val c = pixels[srcRow + x]
-                val r = (((c shr 16) and 0xFF) / 255f - 0.5f) / 0.5f
-                val g = (((c shr 8) and 0xFF) / 255f - 0.5f) / 0.5f
-                val b = ((c and 0xFF) / 255f - 0.5f) / 0.5f
-                tensorData[dstRow + x] = b
-                tensorData[channelSize + dstRow + x] = g
-                tensorData[2 * channelSize + dstRow + x] = r
+                tensorData[dstRow + x] = ((c and 0xFF) / 255f - 0.5f) / 0.5f
+                tensorData[channelSize + dstRow + x] = (((c shr 8) and 0xFF) / 255f - 0.5f) / 0.5f
+                tensorData[2 * channelSize + dstRow + x] = (((c shr 16) and 0xFF) / 255f - 0.5f) / 0.5f
             }
         }
 
@@ -92,44 +94,62 @@ class PaddleOnnxRecognizer(private val context: Context) {
                 if (outShape.size < 3) return null
                 val seqLen = outShape[1].toInt()
                 val numClasses = outShape[2].toInt()
-                val fb = outTensor.floatBuffer
                 val rawOut = FloatArray(seqLen * numClasses)
-                fb.get(rawOut)
-                return decodeCtc(rawOut, seqLen, numClasses)
+                outTensor.floatBuffer.get(rawOut)
+
+                val normal = decodeCtc(rawOut, seqLen, numClasses, numericOnly = false)
+                if (!preferDigits) return normal
+
+                val looksLikePrice = normal.text.count { it.isDigit() } >= 2 &&
+                    !Regex("""[a-zA-Z]{4,}""").containsMatchIn(normal.text)
+                if (!looksLikePrice) return normal
+
+                val constrained = decodeCtc(rawOut, seqLen, numClasses, numericOnly = true)
+                return if (constrained.text.count { it.isDigit() } >= normal.text.count { it.isDigit() } &&
+                    constrained.text.isNotBlank() && constrained.confidence >= 0.45f) {
+                    constrained
+                } else normal
             }
         }
     }
 
-    private fun decodeCtc(data: FloatArray, seqLen: Int, numClasses: Int): PaddleLineResult {
+    private fun decodeCtc(data: FloatArray, seqLen: Int, numClasses: Int, numericOnly: Boolean): PaddleLineResult {
         val sb = StringBuilder()
         var prevIdx = 0
         var confSum = 0f
         var charCount = 0
+        val mask = if (numericOnly) numericAllowedIndices else null
 
         for (t in 0 until seqLen) {
             val base = t * numClasses
-            var maxIdx = 0
-            var maxVal = data[base]
-            var minVal = maxVal
-            var sumVal = 0f
+            var rawMax = data[base]
+            var rawMin = rawMax
+            var rawSum = 0f
             for (c in 0 until numClasses) {
                 val v = data[base + c]
-                sumVal += v
-                if (v > maxVal) { maxVal = v; maxIdx = c }
-                if (v < minVal) minVal = v
+                rawSum += v
+                if (v > rawMax) rawMax = v
+                if (v < rawMin) rawMin = v
             }
-            val prob = if (minVal >= 0f && sumVal in 0.97f..1.03f) {
-                maxVal
-            } else {
-                var expSum = 0f
-                for (c in 0 until numClasses) expSum += exp((data[base + c] - maxVal).toDouble()).toFloat()
-                1f / max(expSum, 1e-6f)
+            val alreadyProb = rawMin >= 0f && rawSum in 0.97f..1.03f
+            val expDenom = if (alreadyProb) 1f else {
+                var s = 0f
+                for (c in 0 until numClasses) s += exp((data[base + c] - rawMax).toDouble()).toFloat()
+                max(s, 1e-6f)
             }
 
-            if (maxIdx != 0 && maxIdx != prevIdx) {
+            var bestIdx = 0
+            var bestScore = Float.NEGATIVE_INFINITY
+            for (c in 0 until numClasses) {
+                if (mask != null && c < mask.size && !mask[c]) continue
+                if (data[base + c] > bestScore) { bestScore = data[base + c]; bestIdx = c }
+            }
+
+            val prob = if (alreadyProb) bestScore else exp((bestScore - rawMax).toDouble()).toFloat() / expDenom
+            if (bestIdx != 0 && bestIdx != prevIdx) {
                 val token = when {
-                    maxIdx - 1 in dict.indices -> dict[maxIdx - 1]
-                    maxIdx == dict.size + 1 -> " "
+                    bestIdx - 1 in dict.indices -> dict[bestIdx - 1]
+                    bestIdx == dict.size + 1 -> " "
                     else -> ""
                 }
                 if (token.isNotEmpty()) {
@@ -138,11 +158,8 @@ class PaddleOnnxRecognizer(private val context: Context) {
                     charCount++
                 }
             }
-            prevIdx = maxIdx
+            prevIdx = bestIdx
         }
-
-        val text = sb.toString().trim()
-        val avgConf = if (charCount > 0) confSum / charCount else 0f
-        return PaddleLineResult(text, avgConf)
+        return PaddleLineResult(sb.toString().trim(), if (charCount > 0) confSum / charCount else 0f)
     }
 }

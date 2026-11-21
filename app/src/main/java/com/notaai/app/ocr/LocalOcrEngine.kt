@@ -25,63 +25,100 @@ class LocalOcrEngine(context: Context) {
         val baseBitmap = BitmapProcessor.upscaleIfTooSmall(bitmap)
         val candidates = mutableListOf<OcrResult>()
         try {
+            val softColor = BitmapProcessor.softNormalizeColor(baseBitmap)
             val whiteRaw = BitmapProcessor.normalizeBackgroundWhitePaper(baseBitmap)
             val cleanWhite = BitmapProcessor.removeThinHorizontalRules(whiteRaw)
             whiteRaw.recycle()
 
             try {
                 if (paddleRecognizer.isAvailable()) {
-                    candidates.add(runPaddlePass(cleanWhite))
+                    candidates.add(runDualImagePaddlePass(cleanWhite, softColor))
                 }
                 candidates.add(runMlKitFullPass(baseBitmap))
                 if (enhanceContrast) {
                     candidates.add(runMlKitFullPass(cleanWhite))
-                    candidates.add(runMlKitColumnSplitPass(cleanWhite))
                 }
             } finally {
                 cleanWhite.recycle()
+                softColor.recycle()
             }
-
             return candidates.maxByOrNull { scoreResult(it) } ?: candidates.first()
         } finally {
             if (baseBitmap !== bitmap) baseBitmap.recycle()
         }
     }
 
-    private fun runPaddlePass(cleanWhite: Bitmap): OcrResult {
+    private fun runDualImagePaddlePass(cleanWhite: Bitmap, softColor: Bitmap): OcrResult {
         val bands = BitmapProcessor.findTextBoxesOnWhitePaper(cleanWhite)
         if (bands.isEmpty()) return OcrResult(emptyList(), "")
 
-        val grouped = linkedMapOf<Int, MutableList<Pair<Rect, PaddleLineResult>>>()
-        for (band in bands) {
-            val r = band.rect
-            val crop = Bitmap.createBitmap(cleanWhite, r.left, r.top, r.width(), r.height())
-            val padded = BitmapProcessor.padWithWhite(crop, 14)
-            crop.recycle()
-            val rec = try {
-                paddleRecognizer.recognizeCrop(padded)
-            } finally {
-                padded.recycle()
-            }
-            if (rec != null && rec.text.isNotBlank()) {
-                grouped.getOrPut(band.rowIndex) { mutableListOf() }.add(r to rec)
-            }
-        }
+        val w = cleanWhite.width
+        val maxRowIdx = bands.maxOf { it.rowIndex }
+        val boxesByRow = bands.groupBy { it.rowIndex }
 
-        val rows = grouped.values.map { rowItems ->
-            val sorted = rowItems.sortedBy { it.first.left }
-            val text = sorted.joinToString(" ") { it.second.text }
-            val minConf = sorted.minOf { it.second.confidence }
-            OcrRecognizedLine(text, minConf)
+        val rows = mutableListOf<OcrRecognizedLine>()
+        for (rowIdx in 0..maxRowIdx) {
+            val rowBands = boxesByRow[rowIdx]?.sortedBy { it.rect.left } ?: continue
+            val recognizedParts = mutableListOf<PaddleLineResult>()
+
+            rowBands.forEachIndexed { idx, band ->
+                val r = band.rect
+                val isPriceCol = (rowBands.size >= 2 && idx == rowBands.lastIndex && r.left >= w * 0.42f) ||
+                    (rowBands.size == 1 && idx == 0 && r.left >= w * 0.48f)
+
+                val recA = recognizeBox(cleanWhite, r, isPriceCol)
+                val recB = recognizeBox(softColor, r, isPriceCol)
+                val best = pickBetterBoxResult(recA, recB, isPriceCol)
+                if (best != null && best.text.isNotBlank()) recognizedParts.add(best)
+            }
+
+            if (recognizedParts.isNotEmpty()) {
+                rows.add(OcrRecognizedLine(
+                    text = recognizedParts.joinToString(" ") { it.text },
+                    confidence = recognizedParts.minOf { it.confidence }
+                ))
+            }
         }
         return OcrResult(rows, rows.joinToString("\n") { it.text })
+    }
+
+    private fun recognizeBox(source: Bitmap, r: Rect, preferDigits: Boolean): PaddleLineResult? {
+        val crop = Bitmap.createBitmap(source, r.left, r.top, r.width(), r.height())
+        val padded = BitmapProcessor.padWithWhite(crop, 20)
+        crop.recycle()
+        return try {
+            paddleRecognizer.recognizeCrop(padded, preferDigits)
+        } finally {
+            padded.recycle()
+        }
+    }
+
+    private fun pickBetterBoxResult(a: PaddleLineResult?, b: PaddleLineResult?, isPriceCol: Boolean): PaddleLineResult? {
+        if (a == null) return b
+        if (b == null) return a
+        if (isPriceCol) {
+            val scoreA = priceBoxQuality(a)
+            val scoreB = priceBoxQuality(b)
+            return if (scoreB > scoreA) b else a
+        }
+        return if (b.confidence > a.confidence) b else a
+    }
+
+    private fun priceBoxQuality(res: PaddleLineResult): Float {
+        val validPriceBonus = if (Regex("""^\d{1,3}[.,\-]\d{3}$""").matches(res.text.trim())) 2.0f else 0f
+        val digitRatio = res.text.count { it.isDigit() }.toFloat() / res.text.length.coerceAtLeast(1)
+        return validPriceBonus + digitRatio + res.confidence
     }
 
     private suspend fun runMlKitFullPass(bmp: Bitmap): OcrResult {
         val padded = BitmapProcessor.padWithWhite(bmp, 36)
         return try {
             val visionText = mlKitRecognizer.process(InputImage.fromBitmap(padded, 0)).await()
-            val boxes = extractBoxes(visionText, -36, -36)
+            val boxes = visionText.textBlocks.flatMap { it.lines }.mapNotNull { line ->
+                val rawBox = line.boundingBox ?: return@mapNotNull null
+                val clean = line.text.trim()
+                if (clean.isEmpty()) null else BoxedLine(clean, Rect(rawBox.left - 36, rawBox.top - 36, rawBox.right - 36, rawBox.bottom - 36), line.confidence)
+            }
             val rows = groupBoxesByVisualRow(boxes)
             OcrResult(rows, rows.joinToString("\n") { it.text })
         } finally {
@@ -89,40 +126,8 @@ class LocalOcrEngine(context: Context) {
         }
     }
 
-    private suspend fun runMlKitColumnSplitPass(whitePaper: Bitmap): OcrResult {
-        val splitX = BitmapProcessor.findBestVerticalSplitX(whitePaper)
-        val h = whitePaper.height
-        val w = whitePaper.width
-        if (splitX < 40 || w - splitX < 40) return runMlKitFullPass(whitePaper)
-
-        val pad = 48
-        val leftCrop = Bitmap.createBitmap(whitePaper, 0, 0, splitX, h)
-        val rightCrop = Bitmap.createBitmap(whitePaper, splitX, 0, w - splitX, h)
-        val leftPadded = BitmapProcessor.padWithWhite(leftCrop, pad)
-        val rightPadded = BitmapProcessor.padWithWhite(rightCrop, pad)
-
-        return try {
-            val leftText = mlKitRecognizer.process(InputImage.fromBitmap(leftPadded, 0)).await()
-            val rightText = mlKitRecognizer.process(InputImage.fromBitmap(rightPadded, 0)).await()
-            val allBoxes = extractBoxes(leftText, -pad, -pad) + extractBoxes(rightText, splitX - pad, -pad)
-            val rows = groupBoxesByVisualRow(allBoxes)
-            OcrResult(rows, rows.joinToString("\n") { it.text })
-        } finally {
-            leftCrop.recycle(); rightCrop.recycle(); leftPadded.recycle(); rightPadded.recycle()
-        }
-    }
-
-    private fun extractBoxes(visionText: Text, offsetX: Int, offsetY: Int): List<BoxedLine> {
-        return visionText.textBlocks.flatMap { it.lines }.mapNotNull { line ->
-            val rawBox = line.boundingBox ?: return@mapNotNull null
-            val clean = line.text.trim()
-            if (clean.isEmpty()) return@mapNotNull null
-            BoxedLine(clean, Rect(rawBox.left + offsetX, rawBox.top + offsetY, rawBox.right + offsetX, rawBox.bottom + offsetY), line.confidence)
-        }
-    }
-
     private fun scoreResult(result: OcrResult): Int {
-        val validPrices = result.lines.count { Regex("""\d{1,3}[.,\- ]\d{3}""").containsMatchIn(it.text) || Regex("""\d{4,}""").containsMatchIn(it.text) }
+        val validPrices = result.lines.count { Regex("""\d{1,3}[.,\- :;']\d{3}""").containsMatchIn(it.text) || Regex("""\d{4,}""").containsMatchIn(it.text) }
         val digitCount = result.rawText.count { it.isDigit() }
         val badLettersInDigits = Regex("""[oOlIsSD]\d|\d[oOlIsSD]""").findAll(result.rawText).count()
         return validPrices * 30 + digitCount * 2 - badLettersInDigits * 10 + result.lines.size
@@ -136,8 +141,7 @@ class LocalOcrEngine(context: Context) {
             val matchingRow = rows.lastOrNull()?.let { lastRow ->
                 val avgY = lastRow.map { it.box.centerY() }.average()
                 val avgH = lastRow.map { it.box.height().coerceAtLeast(14) }.average()
-                val rowLeft = lastRow.minOf { it.box.left }
-                val rowRight = lastRow.maxOf { it.box.right }
+                val rowLeft = lastRow.minOf { it.box.left }; val rowRight = lastRow.maxOf { it.box.right }
                 val overlap = min(rowRight, line.box.right) - max(rowLeft, line.box.left)
                 val minW = min(rowRight - rowLeft, line.box.width()).coerceAtLeast(1)
                 val yTol = if (overlap < minW * 0.25f) avgH * 1.25 else avgH * 0.5

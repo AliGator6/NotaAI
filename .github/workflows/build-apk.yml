@@ -1,0 +1,29 @@
+name: Build NotaAI APK
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+      - name: Siapkan JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Siapkan Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Jalankan Unit Test
+        run: gradle testDebugUnitTest
+      - name: Compile menjadi APK
+        run: gradle assembleDebug
+      - name: Upload File APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NotaAI-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk

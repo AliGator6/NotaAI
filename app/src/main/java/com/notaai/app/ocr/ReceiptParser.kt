@@ -9,31 +9,38 @@ data class ParsedReceiptResult(val items: List<ReceiptItem>, val detectedWritten
 object ReceiptParser {
     private val totalKeywords = listOf("grand total", "total belanja", "total bayar", "total", "jumlah", "jml", "subtotal", "sub total")
     private val nonItemKeywords = listOf("tunai", "cash", "kembali", "kembalian", "bayar", "uang", "terima kasih", "makasih", "tanggal", "tgl", "kasir", "no.", "nota", "bon", "struk", "rp", "harga")
-    private val qtyPriceRegex = Regex("""^(.*?)\s+(\d+(?:[.,]\d+)?)\s*(kg|g|gr|gram|ons|l|ltr|liter|ml|pcs|pc|bh|buah|bks|bungkus|pak|pack|dus|box|btl|botol|kaleng|ikat|siung|ekor|meter|m|x)?\s*[xX×*]\s*(?:rp\.?\s*)?([0-9.,]+)(?:\s*=\s*(?:rp\.?\s*)?([0-9.,]+))?$""", RegexOption.IGNORE_CASE)
-    private val simpleItemPriceRegex = Regex("""^(.+?)\s+(?:rp\.?\s*)?([0-9][0-9.,]{1,12})$""", RegexOption.IGNORE_CASE)
+    private val qtyPriceRegex = Regex("""^(.*?)\s+(\d+(?:[.,]\d+)?)\s*(kg|g|gr|gram|ons|l|ltr|liter|ml|pcs|pc|bh|buah|bks|bungkus|pak|pack|dus|box|btl|botol|kaleng|ikat|siung|ekor|meter|m)?\s*[xX×*]\s*(?:rp\.?\s*)?([0-9.,]+)(?:\s*(?:=|\s)\s*(?:rp\.?\s*)?([0-9.,]+))?$""", RegexOption.IGNORE_CASE)
+    private val simpleItemPriceRegex = Regex("""^(.+?)\s*(?:[:=\-]\s*)?(?:rp\.?\s*)?([0-9][0-9.,]{1,12})$""", RegexOption.IGNORE_CASE)
+    private val standalonePriceRegex = Regex("""^(?:rp\.?\s*)?([0-9][0-9.,]{2,12})$""", RegexOption.IGNORE_CASE)
     private val ambiguousNumberTokenRegex = Regex("""[0-9]+[oOlIsSBb][0-9.,]*|[oOlI][0-9]{2,}""")
 
-    fun parse(lines: List<OcrRecognizedLine>, flagLowConfidence: Boolean = true, lowConfidenceThreshold: Float = 0.72f): ParsedReceiptResult {
+    fun parse(lines: List<OcrRecognizedLine>, flagLowConfidence: Boolean = true, lowConfidenceThreshold: Float = 0.70f): ParsedReceiptResult {
+        val mergedLines = mergeSplitNameAndPriceLines(lines)
         val items = mutableListOf<ReceiptItem>()
         var detectedTotal: Long? = null
-        lines.forEach { line ->
-            val raw = line.text.replace(Regex("""\s+"""), " ").trim()
+
+        mergedLines.forEach { line ->
+            val raw = normalizeReceiptLine(line.text)
             if (raw.length < 2) return@forEach
             val lower = raw.lowercase()
+
             if (totalKeywords.any { kw -> lower.startsWith(kw) || Regex("""\b$kw\b""").containsMatchIn(lower) }) {
                 Regex("""([0-9][0-9.,]{1,14})\s*$""").find(raw)?.let { m ->
                     parseIndonesianRupiahToken(m.groupValues[1])?.takeIf { it > 0L }?.let { detectedTotal = it }
                 }
                 return@forEach
             }
+
             if (nonItemKeywords.any { lower == it || lower.startsWith("$it ") || lower.startsWith("$it:") }) return@forEach
+
             val lowConf = flagLowConfidence && line.confidence != null && line.confidence < lowConfidenceThreshold
             val hasAmbig = ambiguousNumberTokenRegex.containsMatchIn(raw)
+
             val qtyMatch = qtyPriceRegex.find(raw)
             if (qtyMatch != null) {
                 val name = cleanItemName(qtyMatch.groupValues[1])
                 val qty = qtyMatch.groupValues[2].replace(',', '.').toDoubleOrNull()
-                val unit = qtyMatch.groupValues[3].takeIf { it.isNotBlank() && !it.equals("x", true) }
+                val unit = qtyMatch.groupValues[3].takeIf { it.isNotBlank() }
                 val unitPrice = parseIndonesianRupiahToken(qtyMatch.groupValues[4])
                 val parsedTotal = qtyMatch.groupValues[5].takeIf { it.isNotBlank() }?.let { parseIndonesianRupiahToken(it) }
                 if (name.isNotBlank() && qty != null && unitPrice != null) {
@@ -50,6 +57,7 @@ object ReceiptParser {
                     return@forEach
                 }
             }
+
             val simpleMatch = simpleItemPriceRegex.find(raw)
             if (simpleMatch != null) {
                 val name = cleanItemName(simpleMatch.groupValues[1])
@@ -66,6 +74,7 @@ object ReceiptParser {
                     return@forEach
                 }
             }
+
             if (raw.any { it.isLetter() } && (raw.any { it.isDigit() } || hasAmbig)) {
                 val cleaned = cleanItemName(raw)
                 if (cleaned.length >= 2) {
@@ -78,6 +87,45 @@ object ReceiptParser {
             }
         }
         return ParsedReceiptResult(items, detectedTotal)
+    }
+
+    /** Jika ML Kit memisahkan nama barang di baris i dan angka harga di baris i+1, gabungkan kembali. */
+    private fun mergeSplitNameAndPriceLines(lines: List<OcrRecognizedLine>): List<OcrRecognizedLine> {
+        val result = mutableListOf<OcrRecognizedLine>()
+        var i = 0
+        while (i < lines.size) {
+            val curText = normalizeReceiptLine(lines[i].text)
+            val nextText = if (i + 1 < lines.size) normalizeReceiptLine(lines[i + 1].text) else null
+            val curHasLetter = curText.any { it.isLetter() }
+            val curEndsWithPrice = Regex("""[0-9]{3,}$""").containsMatchIn(curText.replace(".", "").replace(",", ""))
+            val nextIsPurePrice = nextText != null && standalonePriceRegex.matches(nextText)
+            val curIsHeader = nonItemKeywords.any { curText.lowercase() == it || curText.lowercase().startsWith("$it ") }
+
+            if (curHasLetter && !curEndsWithPrice && !curIsHeader && nextIsPurePrice) {
+                val confs = listOfNotNull(lines[i].confidence, lines[i + 1].confidence)
+                result.add(OcrRecognizedLine("$curText $nextText", confs.minOrNull()))
+                i += 2
+            } else {
+                result.add(lines[i])
+                i += 1
+            }
+        }
+        return result
+    }
+
+    private fun normalizeReceiptLine(text: String): String {
+        var s = text.replace(Regex("""\s+"""), " ").trim()
+        // Hapus akhiran nota khas Indonesia seperti ",-" atau "/-"
+        s = s.replace(Regex("""[,./]\s*-\s*$"""), "")
+        // Hilangkan spasi di sekitar titik/koma angka: "75. 000" -> "75.000"
+        s = s.replace(Regex("""(\d)\s*([.,])\s*(\d)"""), "$1$2$3")
+        // Gabungkan ribuan yang dipisah spasi di akhir baris: "Beras 75 000" -> "Beras 75.000"
+        var prev: String
+        do {
+            prev = s
+            s = s.replace(Regex("""(\d{1,3})\s+(\d{3})(\s*$)"""), "$1.$2$3")
+        } while (s != prev)
+        return s.trim()
     }
 
     internal fun parseIndonesianRupiahToken(token: String): Long? {

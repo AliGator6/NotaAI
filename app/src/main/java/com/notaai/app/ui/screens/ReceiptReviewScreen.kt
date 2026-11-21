@@ -46,6 +46,7 @@ fun ReceiptReviewScreen(receiptId: Long, onBack: () -> Unit, viewModel: ReceiptR
     val context = LocalContext.current
     val state by viewModel.uiState.collectAsState()
     var showZoomDialog by remember { mutableStateOf(false) }
+    var showRawOcr by remember { mutableStateOf(false) }
     var editingIndex by remember { mutableStateOf<Int?>(null) }
     var showAddOrEditDialog by remember { mutableStateOf(false) }
     var receiptBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -106,6 +107,19 @@ fun ReceiptReviewScreen(receiptId: Long, onBack: () -> Unit, viewModel: ReceiptR
             }
             item {
                 TotalComparisonCard(summary, state.writtenTotalInput) { viewModel.updateWrittenTotalInput(it) }
+            }
+            if (receipt.rawOcrText.isNotBlank()) {
+                item {
+                    OutlinedCard(modifier = Modifier.fillMaxWidth().clickable { showRawOcr = !showRawOcr }) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(if (showRawOcr) "▼ Sembunyikan Teks Asli OCR" else "▶ Lihat Teks Asli yang Dibaca OCR", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                            if (showRawOcr) {
+                                Spacer(Modifier.height(6.dp))
+                                Text(receipt.rawOcrText, style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                }
             }
             item {
                 Text("Daftar Barang (${summary.activeItemCount} aktif, ${summary.crossedOutItemCount} dicoret)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)

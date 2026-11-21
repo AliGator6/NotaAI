@@ -8,7 +8,7 @@ import kotlin.math.max
 import kotlin.math.min
 
 object BitmapProcessor {
-    fun loadNormalizedBitmap(context: Context, uri: Uri, maxDimension: Int = 2200): Bitmap? {
+    fun loadNormalizedBitmap(context: Context, uri: Uri, maxDimension: Int = 2400): Bitmap? {
         val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, boundsOpts) }
         if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) return null
@@ -42,13 +42,29 @@ object BitmapProcessor {
         return Bitmap.createBitmap(source, l, t, w, h)
     }
 
+    /** Perbesar gambar jika terlalu kecil agar tinggi huruf/angka >= 24px untuk ML Kit. */
+    fun upscaleIfTooSmall(source: Bitmap): Bitmap {
+        val minDim = min(source.width, source.height)
+        val maxDim = max(source.width, source.height)
+        if (minDim >= 1000 || maxDim >= 2200) return source
+        val scale = min(2.0f, 2200f / maxDim.toFloat())
+        if (scale <= 1.05f) return source
+        return Bitmap.createScaledBitmap(
+            source,
+            (source.width * scale).toInt(),
+            (source.height * scale).toInt(),
+            true
+        )
+    }
+
+    /** Kontras lembut agar goresan pulpen tidak patah/hilang. */
     fun enhanceContrastForOcr(source: Bitmap): Bitmap {
         val output = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(output)
         val paint = Paint()
         val grayscale = ColorMatrix().apply { setSaturation(0f) }
-        val contrast = 1.45f
-        val translate = (-0.5f * contrast + 0.5f) * 255f
+        val contrast = 1.22f
+        val translate = (-0.5f * contrast + 0.5f) * 255f + 8f
         grayscale.postConcat(ColorMatrix(floatArrayOf(
             contrast, 0f, 0f, 0f, translate,
             0f, contrast, 0f, 0f, translate,
